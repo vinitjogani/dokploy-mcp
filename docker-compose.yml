@@ -1,0 +1,28 @@
+# Deploy as a Dokploy "Compose" service from this repo, then in Dokploy:
+#   Environment: the variables in .env.example (Dokploy writes them to .env next to this file).
+#   Domains:     mcp.example.com -> service "mcp", port 8000, HTTPS on.
+services:
+  mcp:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    volumes:
+      - data:/data
+    # Dokploy's own network: Traefik routes the domain to us over it, and the Dokploy API is
+    # reachable on it as http://dokploy:3000, so API calls never leave the host.
+    networks:
+      - dokploy-network
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  dokploy-network:
+    external: true
+
+volumes:
+  data:
