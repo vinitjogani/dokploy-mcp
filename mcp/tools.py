@@ -7,8 +7,9 @@ DESTRUCTIVE tools carry ``destructiveHint`` so the agent's harness asks the user
 only offered to connectors granted the destructive scope on the consent screen.
 
 What the tools can never do, whatever the arguments: deploy anything but a GitHub repository the
-Dokploy GitHub App can already see, set Dokploy fields that reach a shell or the host (custom
-command, raw compose file, compose paths outside the checkout, Traefik middlewares/entrypoints),
+Dokploy GitHub App can already see or a raw compose file that passes mcp.compose (allowlisted keys,
+images from ALLOWED_REGISTRIES / ALLOWED_IMAGES only), set Dokploy fields that reach a shell or the
+host (custom command, compose paths outside the checkout, Traefik middlewares/entrypoints),
 touch non-compose services, change PROTECTED_SERVICES, route a host that belongs to another
 service, the Dokploy panel or PROTECTED_HOSTS, or show env values and webhook tokens.
 """
@@ -21,6 +22,7 @@ from typing import Annotated, get_type_hints
 from django.conf import settings
 from pydantic import AfterValidator, ConfigDict, Field, ValidationError, create_model
 
+from mcp import compose as compose_file
 from mcp.dokploy import DokployError, api
 from mcp.models import SCOPE_DESTRUCTIVE, AuditLog
 
@@ -28,6 +30,7 @@ logger = logging.getLogger(__name__)
 READ, WRITE, DESTRUCTIVE = "read", "write", "destructive"
 MAX_OUTPUT = 60_000  # characters; keeps results inside every client's tool-result limit
 TOOLS = {}
+RAW_COMPOSE_TOOLS = {"create_compose_service", "set_compose_file"}  # only offered once an allowlist is set
 
 
 class ToolError(Exception):
@@ -53,7 +56,8 @@ def tool(kind):
 
 
 def allowed_tools(token):
-    return {n: s for n, s in TOOLS.items() if s[2] != DESTRUCTIVE or SCOPE_DESTRUCTIVE in token.scope.split()}
+    return {n: s for n, s in TOOLS.items() if (s[2] != DESTRUCTIVE or SCOPE_DESTRUCTIVE in token.scope.split())
+            and (n not in RAW_COMPOSE_TOOLS or compose_file.raw_compose_enabled())}
 
 
 def list_tools(token):
@@ -73,7 +77,7 @@ def call_tool(token, name, arguments):
         except ValidationError as exc:
             text = "Invalid arguments: " + "; ".join(
                 f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors(include_input=False, include_url=False))
-        except (ToolError, DokployError) as exc:
+        except (ToolError, DokployError, compose_file.ComposeError) as exc:
             text = str(exc)
         except Exception:
             logger.exception("Tool %s failed", name)
@@ -113,6 +117,8 @@ UrlPath = Str(r"^/[A-Za-z0-9._~/-]{0,100}$", "URL path prefix routed to the serv
 # Dokploy vault secrets into an app, where its logs could reveal them.
 EnvKey = Str(r"^(?!COMPOSE_|DOCKER_|APP_NAME$)[A-Za-z_][A-Za-z0-9_]{0,127}$", "Variable name.")
 EnvValue = Str(r"^(?!.*\$\{\{)[^\r\n\x00]*$", "Single-line value.", max_length=8192)
+ComposeFile = Annotated[str, Field(min_length=1, max_length=compose_file.MAX_SIZE,
+                                   description="The docker-compose.yml content (YAML).")]
 Tail = Annotated[int, Field(ge=1, le=2000, description="Number of log lines.")]
 
 # ---------------------------------------------------------------------------- helpers
@@ -210,7 +216,8 @@ def summarize(c):
     return {
         "compose_id": c["composeId"], "name": c["name"], "app_name": c["appName"], "status": c["composeStatus"],
         "project": c["environment"]["project"]["name"], "project_id": c["environment"]["project"]["projectId"],
-        "environment": c["environment"]["name"], "repo": repo_of(c), "branch": c.get("branch"),
+        "environment": c["environment"]["name"], "source": "github" if repo_of(c) else c.get("sourceType"),
+        "repo": repo_of(c), "branch": c.get("branch"),
         "compose_path": c.get("composePath"), "auto_deploy": c.get("autoDeploy"), "watch_paths": c.get("watchPaths"),
         "env_keys": env_keys(c.get("env")), "protected": is_protected(c),
         "domains": [{"domain_id": d["domainId"], "url": f"{'https' if d['https'] else 'http'}://{d['host']}{d['path'] or ''}",
@@ -218,6 +225,20 @@ def summarize(c):
         "recent_deployments": [{"deployment_id": d["deploymentId"], "title": d["title"], "status": d["status"],
                                 "created_at": d["createdAt"], "error": d.get("errorMessage")} for d in deployments],
     }
+
+
+def new_compose(project, name):
+    """Create an empty compose service in `project` (found by name, or created)."""
+    existing = next((p for p in api("project.all") if p["name"] == project), None)
+    if existing:
+        environment = next((e for e in existing["environments"] if e["isDefault"]), existing["environments"][0])
+        clash = next((s for e in existing["environments"] for s in e["compose"] if s["name"] == name), None)
+        if clash:
+            raise ToolError(f"Project '{project}' already has a service named '{name}' (compose_id {clash['composeId']}).")
+        environment_id = environment["environmentId"]
+    else:
+        environment_id = api("project.create", {"name": project})["environment"]["environmentId"]
+    return api("compose.create", {"name": name, "appName": name, "environmentId": environment_id, "composeType": "docker-compose"})
 
 
 def save_env(compose_id, **edits):
@@ -250,9 +271,11 @@ def list_services(repo: Annotated[str, Field(max_length=150, description="Option
 @tool(READ)
 def get_service(compose_id: Id):
     """Full configuration of one compose service: repo, branch, compose path, auto-deploy, env var
-    names (values are never shown), domains, the compose file's service names, and recent deployments."""
+    names (values are never shown), domains, the compose file's service names, recent deployments,
+    and for services without a repo (source "raw") the compose file itself."""
     c = compose(compose_id)
-    return summarize(c) | {"compose_services": compose_services(c)}
+    raw = {"compose_yaml": c.get("composeFile")} if c.get("sourceType") == "raw" else {}
+    return summarize(c) | {"compose_services": compose_services(c)} | raw
 
 
 @tool(READ)
@@ -298,21 +321,42 @@ def create_service(project: ProjectName, name: Slug, repo: Repo, branch: Branch 
     project has that name. Does not deploy: add domains / env vars as needed, then call
     deploy_service."""
     source = resolve_repo(repo, branch)
-    existing = next((p for p in api("project.all") if p["name"] == project), None)
-    if existing:
-        environment = next((e for e in existing["environments"] if e["isDefault"]), existing["environments"][0])
-        clash = next((s for e in existing["environments"] for s in e["compose"] if s["name"] == name), None)
-        if clash:
-            raise ToolError(f"Project '{project}' already has a service named '{name}' (compose_id {clash['composeId']}).")
-        environment_id = environment["environmentId"]
-    else:
-        environment_id = api("project.create", {"name": project})["environment"]["environmentId"]
-    c = api("compose.create", {"name": name, "appName": name, "environmentId": environment_id, "composeType": "docker-compose"})
+    c = new_compose(project, name)
     api("compose.update", {"composeId": c["composeId"], "sourceType": "github", **source, "composePath": compose_path,
                            "autoDeploy": True, "triggerType": "push", "watchPaths": [], "enableSubmodules": False})
     if env:
         api("compose.saveEnvironment", {"composeId": c["composeId"], "env": edit_env("", env)})
     return get_service(c["composeId"])
+
+
+@tool(WRITE)
+def create_compose_service(project: ProjectName, name: Slug, compose_yaml: ComposeFile,
+                           env: dict[EnvKey, EnvValue] | None = None):
+    """Create a Docker Compose service from a raw compose file instead of a GitHub repo, for
+    prebuilt images (e.g. from a container registry). Every service needs an `image` from the
+    server's allowed registries/images (no `build`); only named volumes (no host paths), no
+    published ports (use add_domain), no privileged/host options, and `env_file` only as `.env`
+    (the variables from set_env_vars, also usable as ${NAME}). There is no auto-deploy: call
+    deploy_service after this, and again after changing the image tag (or set
+    `pull_policy: always` to re-pull the same tag on every deploy). The project is created if no
+    project has that name."""
+    compose_file.validate(compose_yaml)
+    c = new_compose(project, name)
+    api("compose.update", {"composeId": c["composeId"], "sourceType": "raw", "composeFile": compose_yaml, "autoDeploy": False})
+    if env:
+        api("compose.saveEnvironment", {"composeId": c["composeId"], "env": edit_env("", env)})
+    return get_service(c["composeId"])
+
+
+@tool(WRITE)
+def set_compose_file(compose_id: Id, compose_yaml: ComposeFile):
+    """Replace a service's compose file with raw content (same rules as create_compose_service).
+    A service deployed from GitHub switches to this file and stops auto-deploying; update_service
+    with `repo` (and auto_deploy=true) switches it back. Takes effect on the next deploy_service."""
+    compose(compose_id, write=True)
+    compose_file.validate(compose_yaml)
+    api("compose.update", {"composeId": compose_id, "sourceType": "raw", "composeFile": compose_yaml, "autoDeploy": False})
+    return summarize(compose(compose_id))
 
 
 @tool(WRITE)
