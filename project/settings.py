@@ -46,6 +46,12 @@ DOMAINS = [d.strip(".").lower() for d in env_list("DOMAINS", _public.hostname.pa
 PROTECTED_SERVICES = {s.lower() for s in env_list("PROTECTED_SERVICES")} | {"dokploy-mcp"}
 # Hosts that may never be routed to a service (the Dokploy panel, this server, ...).
 PROTECTED_HOSTS = {h.lower() for h in env_list("PROTECTED_HOSTS")} | {_public.hostname}
+# Raw compose deploys (no GitHub repo) are off unless one of these is set. Every image in such a
+# compose file must come from an ALLOWED_REGISTRIES host ("*" for any) or match ALLOWED_IMAGES:
+# "ghcr.io/acme/blog" (any tag), "nginx:1.27" (that tag only), "ghcr.io/acme/*" (a namespace).
+ALLOWED_REGISTRIES = {"docker.io" if r in {"index.docker.io", "registry-1.docker.io", "registry.hub.docker.com"} else r
+                      for r in (r.lower() for r in env_list("ALLOWED_REGISTRIES"))}
+ALLOWED_IMAGES = env_list("ALLOWED_IMAGES")
 # Redirect URIs a connector may register, besides http://localhost:<port>/... for local apps.
 OAUTH_REDIRECT_URIS = env_list("OAUTH_REDIRECT_URIS", "https://claude.ai/api/mcp/auth_callback,https://claude.com/api/mcp/auth_callback")
 

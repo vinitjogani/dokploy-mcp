@@ -2,21 +2,25 @@
 
 A small, locked-down [MCP](https://modelcontextprotocol.io) server that lets AI agents
 (claude.ai, the Claude apps, Claude Code, …) deploy and manage **Docker Compose services on
-your Dokploy instance**, straight from your GitHub repos. It runs as a Dokploy app itself, at
+your Dokploy instance**, straight from your GitHub repos, or (if you allow it) from raw compose
+files using prebuilt images from registries you allowlist. It runs as a Dokploy app itself, at
 `https://mcp.example.com/mcp`.
 
 Django + OAuth 2.1, no MCP SDK: `mcp/tools.py` (the tools and their guards), `mcp/oauth.py`
-(authorization server), `mcp/views.py` (JSON-RPC endpoint), `mcp/dokploy.py` (API client).
+(authorization server), `mcp/views.py` (JSON-RPC endpoint), `mcp/dokploy.py` (API client),
+`mcp/compose.py` (raw compose file checks).
 
 ## Tools
 
 | Tool | Kind | What it does |
 |---|---|---|
 | `list_services` | read | Projects and their compose services with repo, branch, status and URLs; `repo` filter finds the service that deploys a given GitHub repo. |
-| `get_service` | read | One service: settings, env var **names**, domains, compose service names, recent deployments. |
+| `get_service` | read | One service: settings, env var **names**, domains, compose service names, recent deployments (and the compose file, for raw ones). |
 | `get_deployment_logs` | read | Build/deploy log of the latest (or a given) deployment: git pull, image build, start-up. |
 | `get_container_logs` | read | Runtime stdout/stderr of one running container of a service. |
 | `create_service` | write | Project (found or created) + compose service building from `owner/repo`, auto-deploying on every push to the branch (so a merged PR deploys itself), optional env vars. |
+| `create_compose_service` | write | Same, from a raw compose file instead of a repo: prebuilt images only, from `ALLOWED_REGISTRIES` / `ALLOWED_IMAGES` (see below). No auto-deploy. Only offered when an allowlist is set. |
+| `set_compose_file` | write | Replace a service's compose file with raw content (same checks); switches a GitHub service to it. |
 | `update_service` | write | Repo, branch, compose path, auto-deploy, watch paths. |
 | `set_env_vars` | write | Add/overwrite variables; other variables are kept. |
 | `add_domain` | write | `https://blog.example.com` → a compose service/port, Let's Encrypt certificate. `"blog"` is enough. `https=false` for hosts behind a TLS proxy such as Cloudflare (Flexible SSL), which would otherwise redirect-loop. |
@@ -35,6 +39,34 @@ agent only calls `deploy_service` after changing env vars or domains.
 
 Env values given to the server are written in the `.env` Dokploy places next to the compose file
 (used for `${VAR}` interpolation, or `env_file: .env`). They are never shown back to agents.
+
+## Raw compose files
+
+Off by default. Set `ALLOWED_REGISTRIES` and/or `ALLOWED_IMAGES` to let agents deploy a compose
+file directly (`create_compose_service`, `set_compose_file`) using prebuilt images:
+
+```
+ALLOWED_REGISTRIES=ghcr.io                      # any image from these registries ("*" = any registry)
+ALLOWED_IMAGES=nginx,redis:7,quay.io/acme/*     # or just these, whatever their registry
+```
+
+An `ALLOWED_IMAGES` entry without a tag allows every tag (`nginx`); with a tag or digest, only that
+one (`redis:7`); ending in `/*`, everything under that namespace (`quay.io/acme/*`). `docker.io`
+means Docker Hub, and `nginx` is `docker.io/library/nginx`.
+
+A compose file is root on the host, so only a safe subset of the compose spec is accepted; the
+rest is refused with an error naming the offending key:
+
+* every service needs an allowed `image` (no `build`, no `${...}` in it);
+* volumes are named volumes declared under top-level `volumes` (no host paths, Docker socket,
+  `driver_opts` binds, or `external`/`name` adopting another stack's data), or `tmpfs`;
+* no `privileged`, `cap_add`, `devices`, `security_opt`, `network_mode`, `pid`, `ipc`, `ports`,
+  `container_name`, `extends`, `include`, `secrets`/`configs`, top-level `name`, external networks;
+* no `traefik.*`/`com.docker.*` labels (routing goes through `add_domain`), no Dokploy
+  `${{...}}` references, `env_file` only as `.env`, no YAML anchors, at most 64 KiB.
+
+Raw services do not auto-deploy: the agent changes the tag and calls `deploy_service` (or uses
+`pull_policy: always` to re-pull the same tag on every deploy).
 
 ## Approvals for destructive tools
 
@@ -55,8 +87,10 @@ Assume a prompt-injected agent holds a valid token. Everything below holds anywa
 enforced in code and covered by tests.
 
 * **Only your code is deployed.** A repo must be one the Dokploy GitHub App can already access
-  (checked live), and the branch must exist. No raw compose files, custom git URLs or custom
-  `docker` commands: those give root on the host. Only allowlisted Dokploy fields are ever sent.
+  (checked live), and the branch must exist. Raw compose files are off unless you set an image
+  allowlist, and then pass the checks above (only images you allow, nothing that reaches the
+  host). No custom git URLs or custom `docker` commands: those give root on the host. Only
+  allowlisted Dokploy fields are ever sent.
 * **Strict input patterns** on every argument (names, branches, compose paths, hosts, URL paths,
   env keys/values) block the injection points found in Dokploy itself: `..` in compose paths
   (arbitrary file writes on the host), Traefik rule injection through the domain path, and
@@ -84,7 +118,9 @@ enforced in code and covered by tests.
 
 Remaining trust: whoever can push to your repos can run anything in their compose files (and so
 also, for example, claim the `dokploy` name on `dokploy-network` that `DOKPLOY_URL` uses). That is
-Dokploy's model too; this server just makes sure it is *your* repos.
+Dokploy's model too; this server just makes sure it is *your* repos. Likewise, whoever can push
+to an allowlisted image (or registry, or `*`: all of Docker Hub) can run their code on the host
+inside an unprivileged container, with the network access every container has.
 
 ## Setup
 
