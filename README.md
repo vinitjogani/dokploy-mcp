@@ -137,7 +137,9 @@ inside an unprivileged container, with the network access every container has.
    ```
    If the site is down after a deploy, check the `mcp` container logs: a weak `ADMIN_PASSWORD`
    stops it from starting.
-4. **Domain**: `mcp.example.com` → service `mcp`, port `8000`, HTTPS, Let's Encrypt. Deploy.
+4. **Domain**: `mcp.example.com` → service `gateway`, port `80`, HTTPS, Let's Encrypt. Deploy.
+   (`gateway` is a stock nginx in front of the MCP, configured by `gateway/40-gateway.sh`; it also
+   serves the optional registry below.)
 5. **Connect an agent** to `https://mcp.example.com/mcp`:
    * claude.ai: Settings → Connectors → *Add custom connector*.
    * Claude Code: `claude mcp add --transport http dokploy https://mcp.example.com/mcp`, then `/mcp`
@@ -157,6 +159,43 @@ port is needed. If your Dokploy runs differently, set `DOKPLOY_URL` (for example
 * **Revoke one connector:** `/admin` → OAuth clients → delete it (or tick *revoked* on a token).
 * **Rotate the session/signing key:** delete `/data/secret_key` from the volume and redeploy.
 * **What did an agent do?** `/admin` → Audit logs.
+
+## Optional: container registry
+
+The same deploy can also run a private Docker registry (`registry:2`) with a web UI
+(`joxit/docker-registry-ui`), on the **same domain**, handy for pushing images that raw compose
+services then pull. It is off by default. To turn it on, add to the service's environment and
+deploy:
+
+```
+COMPOSE_PROFILES=registry
+REGISTRY_USERS=alice:<password>,ci:<password>
+```
+
+No extra domains: the gateway keeps routing the MCP's paths (`/mcp`, `/oauth/`, `/admin/`,
+`/static/`, `/.well-known/`) to it, sends `/v2/` to the registry, and everything else to the UI.
+Then `docker login mcp.example.com` and push `mcp.example.com/team/app:1`; the UI is at
+`https://mcp.example.com/`.
+
+* **Logins** live only in `REGISTRY_USERS` (`user:password`, comma-separated; a password may
+  contain `:` but not `,`). On every deploy a one-shot `registry-auth` container (stock
+  `httpd:2-alpine`, for its `htpasswd`) rebuilds a bcrypt htpasswd file from it, and the gateway
+  (stock `nginx:1.29-alpine`) checks every registry and UI request against that file, re-reading
+  it each time. So adding a user, changing a password or removing someone is an env edit plus a
+  deploy. The registry itself has no auth and sits on a private network only the gateway can
+  reach. An entry without `user:password` is skipped and `registry-auth` exits with an error
+  (see its logs); with no valid entry, every registry request is refused. The MCP keeps working
+  either way.
+* **Optional:** `REGISTRY_HTTP_SECRET` (a long random string; otherwise a random one per start,
+  which only interrupts uploads in flight during a restart), `REGISTRY_TITLE` (shown in the UI).
+* Agents cannot touch any of this: it is part of this server's own service, which the tools never
+  change. (The `mcp` container does receive these variables through `env_file: .env`, so changing
+  them restarts it too.)
+* To turn it off, remove `COMPOSE_PROFILES`, deploy, and stop the leftover `registry*` containers;
+  images stay in the `registry-data` volume.
+
+To let agents deploy from it, add it to `ALLOWED_REGISTRIES=mcp.example.com` and run
+`docker login mcp.example.com` once on the Dokploy host so compose deploys can pull.
 
 ## Development
 

@@ -1,17 +1,36 @@
 # Deploy as a Dokploy "Compose" service from this repo, then in Dokploy:
 #   Environment: the variables in .env.example (Dokploy writes them to .env next to this file).
-#   Domains:     mcp.example.com -> service "mcp", port 8000, HTTPS on.
+#   Domains:     mcp.example.com -> service "gateway", port 80, HTTPS on. That one domain serves
+#                the MCP and, with COMPOSE_PROFILES=registry, the container registry and its UI.
 services:
+  # The only service Traefik routes to: stock nginx, configured by gateway/40-gateway.sh.
+  gateway:
+    image: nginx:1.29-alpine
+    restart: unless-stopped
+    environment:
+      REGISTRY_PROFILES: ${COMPOSE_PROFILES:-}
+    volumes:
+      - ./gateway/40-gateway.sh:/docker-entrypoint.d/40-gateway.sh:ro
+      - registry-auth:/auth:ro
+    networks:
+      - dokploy-network
+      - mcp
+      - registry
+    security_opt:
+      - no-new-privileges:true
+
   mcp:
     build: .
     restart: unless-stopped
     env_file: .env
     volumes:
       - data:/data
-    # Dokploy's own network: Traefik routes the domain to us over it, and the Dokploy API is
-    # reachable on it as http://dokploy:3000, so API calls never leave the host.
+    # dokploy-network: the Dokploy API is reachable on it as http://dokploy:3000, so API calls
+    # never leave the host. Requests come in from the gateway over "mcp".
     networks:
-      - dokploy-network
+      dokploy-network:
+      mcp:
+        aliases: [dokploy-mcp-app]  # unique: plain "mcp" may exist on other stacks' networks
     read_only: true
     tmpfs:
       - /tmp
@@ -20,9 +39,89 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # Optional container registry + web UI, off unless COMPOSE_PROFILES=registry (see README).
+  # Registry and UI sit on a private network with no way out; the gateway checks every login.
+  #
+  # registry-auth rebuilds the gateway's htpasswd file from REGISTRY_USERS ("alice:pw1,bob:pw2") on every
+  # deploy (compose re-runs it, recreating it when the users change), so changing a password or
+  # removing a user is an env edit plus a deploy.
+  registry-auth:
+    image: httpd:2-alpine  # only for its htpasswd binary
+    profiles: [registry]
+    restart: "no"
+    environment:
+      REGISTRY_USERS: ${REGISTRY_USERS:-}
+    volumes:
+      - registry-auth:/auth
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu -f
+        status=0
+        : > /auth/htpasswd.tmp
+        IFS=,
+        for entry in $$REGISTRY_USERS; do
+          case "$$entry" in
+            ?*:?*) htpasswd -Bbn "$${entry%%:*}" "$${entry#*:}" | head -n1 >> /auth/htpasswd.tmp ;;
+            "") ;;
+            *) echo "skipping a REGISTRY_USERS entry that is not user:password" >&2; status=1 ;;
+          esac
+        done
+        chmod 644 /auth/htpasswd.tmp && mv /auth/htpasswd.tmp /auth/htpasswd
+        users=$$(cut -d: -f1 /auth/htpasswd | paste -sd, -)
+        [ -n "$$users" ] || { echo "REGISTRY_USERS has no logins: every registry request is refused" >&2; exit 1; }
+        echo "registry users: $$users"
+        exit $$status
+
+  registry:
+    image: registry:2
+    profiles: [registry]
+    restart: unless-stopped
+    environment:
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+      REGISTRY_HEALTH_STORAGEDRIVER_ENABLED: "false"
+      REGISTRY_HTTP_RELATIVEURLS: "true"
+      REGISTRY_HTTP_SECRET: ${REGISTRY_HTTP_SECRET:-}
+    volumes:
+      - registry-data:/var/lib/registry
+    networks:
+      registry:
+        aliases: [dokploy-mcp-registry]
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  registry-ui:
+    image: joxit/docker-registry-ui:2.6.0
+    profiles: [registry]
+    restart: unless-stopped
+    environment:
+      REGISTRY_TITLE: ${REGISTRY_TITLE:-Registry}
+      SINGLE_REGISTRY: "true"
+      DELETE_IMAGES: "true"
+    networks:
+      registry:
+        aliases: [dokploy-mcp-registry-ui]
+    security_opt:
+      - no-new-privileges:true
+
 networks:
   dokploy-network:
     external: true
+  mcp:
+    internal: true
+  registry:
+    internal: true
 
 volumes:
   data:
+  registry-auth:
+  registry-data:
