@@ -1,12 +1,12 @@
 #!/bin/sh
-# Writes the nginx config on every start, so every deploy applies the current environment:
-#   REGISTRY_PROFILES  the stack's COMPOSE_PROFILES; containing "registry" turns the registry on.
-#   REGISTRY_USERS     its logins, "user:password,user2:password2" (a password may contain ":").
-# The registry itself runs without auth on a private network: nginx checks every login.
+# Mounted into the stock nginx image's /docker-entrypoint.d/: writes the gateway's config on every
+# start. REGISTRY_PROFILES is the stack's COMPOSE_PROFILES; containing "registry" turns on the
+# registry routes. The registry itself has no auth: nginx checks every login against
+# /auth/htpasswd, which the registry-auth container rewrites on every deploy (nginx re-reads it
+# on each request, so new logins apply without a restart).
 set -eu
 
 conf=/etc/nginx/conf.d/default.conf
-users=/etc/nginx/registry.htpasswd
 
 case ",${REGISTRY_PROFILES:-}," in *,registry,*) registry=1 ;; *) registry= ;; esac
 
@@ -43,28 +43,7 @@ server {
 NGINX
 
 if [ -n "$registry" ]; then
-    tmp="$users.tmp"
-    : > "$tmp"
-    n=0
-    # Never fails: a bad entry is skipped and logged, since failing here would take the MCP down.
-    set -f  # no globbing of passwords
-    IFS=,
-    for entry in ${REGISTRY_USERS:-}; do
-        case "$entry" in
-            ?*:?*) htpasswd -Bbn "${entry%%:*}" "${entry#*:}" | head -n1 >> "$tmp"; n=$((n + 1)) ;;
-            "") ;;
-            *) echo "gateway: skipping a REGISTRY_USERS entry that is not user:password" >&2 ;;
-        esac
-    done
-    unset IFS
-    set +f
-    chmod 640 "$tmp" && chgrp nginx "$tmp" && mv "$tmp" "$users"
-    if [ "$n" -eq 0 ]; then
-        echo "gateway: registry on but REGISTRY_USERS has no logins: every request will be refused" >&2
-    else
-        echo "gateway: registry on, users: $(cut -d: -f1 "$users" | paste -sd, -)"
-    fi
-
+    echo "gateway: registry on"
     cat >> "$conf" <<'NGINX'
     set $registry http://dokploy-mcp-registry:5000;
     set $registry_ui http://dokploy-mcp-registry-ui:80;
@@ -77,7 +56,7 @@ if [ -n "$registry" ]; then
     # The registry API (docker login/push/pull, and the UI's own calls).
     location /v2/ {
         auth_basic "Registry";
-        auth_basic_user_file /etc/nginx/registry.htpasswd;
+        auth_basic_user_file /auth/htpasswd;
         add_header Docker-Distribution-Api-Version $docker_distribution_api_version always;
         # Docker 1.5 and earlier mishandle the auth flow.
         if ($http_user_agent ~ "^(docker/1\.(3|4|5(?!\.[0-9]-dev))|Go ).*$") {
@@ -89,13 +68,12 @@ if [ -n "$registry" ]; then
     # Everything else: the UI, behind the same login, so the browser asks once.
     location / {
         auth_basic "Registry";
-        auth_basic_user_file /etc/nginx/registry.htpasswd;
+        auth_basic_user_file /auth/htpasswd;
         proxy_pass $registry_ui;
     }
 }
 NGINX
 else
-    rm -f "$users"
     echo "gateway: registry off"
     cat >> "$conf" <<'NGINX'
     location / {

@@ -3,14 +3,15 @@
 #   Domains:     mcp.example.com -> service "gateway", port 80, HTTPS on. That one domain serves
 #                the MCP and, with COMPOSE_PROFILES=registry, the container registry and its UI.
 services:
-  # The only service Traefik routes to (see gateway/40-gateway.sh for the routes).
+  # The only service Traefik routes to: stock nginx, configured by gateway/40-gateway.sh.
   gateway:
-    build: ./gateway
+    image: nginx:1.29-alpine
     restart: unless-stopped
     environment:
       REGISTRY_PROFILES: ${COMPOSE_PROFILES:-}
-      # In the environment so that changing it recreates the gateway, which rehashes the logins.
-      REGISTRY_USERS: ${REGISTRY_USERS:-}
+    volumes:
+      - ./gateway/40-gateway.sh:/docker-entrypoint.d/40-gateway.sh:ro
+      - registry-auth:/auth:ro
     networks:
       - dokploy-network
       - mcp
@@ -39,7 +40,45 @@ services:
       - no-new-privileges:true
 
   # Optional container registry + web UI, off unless COMPOSE_PROFILES=registry (see README).
-  # Both sit on a private network with no way out; the gateway checks every login.
+  # Registry and UI sit on a private network with no way out; the gateway checks every login.
+  #
+  # registry-auth rebuilds the gateway's htpasswd file from REGISTRY_USERS ("alice:pw1,bob:pw2") on every
+  # deploy (compose re-runs it, recreating it when the users change), so changing a password or
+  # removing a user is an env edit plus a deploy.
+  registry-auth:
+    image: httpd:2-alpine  # only for its htpasswd binary
+    profiles: [registry]
+    restart: "no"
+    environment:
+      REGISTRY_USERS: ${REGISTRY_USERS:-}
+    volumes:
+      - registry-auth:/auth
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu -f
+        status=0
+        : > /auth/htpasswd.tmp
+        IFS=,
+        for entry in $$REGISTRY_USERS; do
+          case "$$entry" in
+            ?*:?*) htpasswd -Bbn "$${entry%%:*}" "$${entry#*:}" | head -n1 >> /auth/htpasswd.tmp ;;
+            "") ;;
+            *) echo "skipping a REGISTRY_USERS entry that is not user:password" >&2; status=1 ;;
+          esac
+        done
+        chmod 644 /auth/htpasswd.tmp && mv /auth/htpasswd.tmp /auth/htpasswd
+        users=$$(cut -d: -f1 /auth/htpasswd | paste -sd, -)
+        [ -n "$$users" ] || { echo "REGISTRY_USERS has no logins: every registry request is refused" >&2; exit 1; }
+        echo "registry users: $$users"
+        exit $$status
+
   registry:
     image: registry:2
     profiles: [registry]
@@ -84,4 +123,5 @@ networks:
 
 volumes:
   data:
+  registry-auth:
   registry-data:
