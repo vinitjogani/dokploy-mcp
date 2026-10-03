@@ -20,9 +20,91 @@ services:
     security_opt:
       - no-new-privileges:true
 
+  # Optional container registry with a web UI, off unless COMPOSE_PROFILES=registry (see README).
+  # Users come from REGISTRY_USERS ("alice:pw1,bob:pw2"): the htpasswd file is rebuilt from it on
+  # every deploy, so changing a password or removing a user is an env edit plus a redeploy.
+  registry-auth:
+    image: httpd:2-alpine  # only for its htpasswd binary, which registry:2 no longer ships
+    profiles: [registry]
+    restart: "no"
+    environment:
+      REGISTRY_USERS: ${REGISTRY_USERS:-}
+    volumes:
+      - registry-auth:/auth
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        [ -n "$$REGISTRY_USERS" ] || { echo "REGISTRY_USERS is empty: refusing to lock everyone out" >&2; exit 1; }
+        : > /auth/htpasswd.tmp
+        echo "$$REGISTRY_USERS" | tr ',' '\n' | while IFS= read -r entry; do
+          [ -n "$$entry" ] || continue
+          case "$$entry" in *:?*) ;; *) echo "REGISTRY_USERS entry without user:password" >&2; exit 1;; esac
+          htpasswd -Bbn "$${entry%%:*}" "$${entry#*:}" | head -n1 >> /auth/htpasswd.tmp
+        done
+        mv /auth/htpasswd.tmp /auth/htpasswd
+        echo "registry users: $$(cut -d: -f1 /auth/htpasswd | paste -sd, -)"
+
+  registry:
+    image: registry:2
+    profiles: [registry]
+    restart: unless-stopped
+    depends_on:
+      registry-auth:
+        condition: service_completed_successfully
+    environment:
+      REGISTRY_AUTH: htpasswd
+      REGISTRY_AUTH_HTPASSWD_REALM: Registry
+      REGISTRY_AUTH_HTPASSWD_PATH: /auth/htpasswd
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+      REGISTRY_HEALTH_STORAGEDRIVER_ENABLED: "false"
+      REGISTRY_HTTP_SECRET: ${REGISTRY_HTTP_SECRET:-}
+      REGISTRY_HTTP_HOST: ${REGISTRY_HTTP_HOST:-}
+      # Unused by the registry: it only reads htpasswd at start-up, so this makes compose recreate
+      # it (after registry-auth has rewritten the file) whenever the users change.
+      REGISTRY_USERS_REVISION: ${REGISTRY_USERS:-}
+    volumes:
+      - registry-auth:/auth:ro
+      - registry-data:/var/lib/registry
+    networks:
+      dokploy-network:
+      registry:
+        aliases: [dokploy-mcp-registry]  # unique: plain "registry" may exist on dokploy-network
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  registry-ui:
+    image: joxit/docker-registry-ui:latest
+    profiles: [registry]
+    restart: unless-stopped
+    depends_on:
+      - registry
+    environment:
+      REGISTRY_TITLE: ${REGISTRY_TITLE:-Registry}
+      NGINX_PROXY_PASS_URL: http://dokploy-mcp-registry:5000
+      SINGLE_REGISTRY: "true"
+      DELETE_IMAGES: "true"
+    networks:
+      - dokploy-network
+      - registry
+    security_opt:
+      - no-new-privileges:true
+
 networks:
   dokploy-network:
     external: true
+  registry:
 
 volumes:
   data:
+  registry-auth:
+  registry-data:

@@ -158,6 +158,37 @@ port is needed. If your Dokploy runs differently, set `DOKPLOY_URL` (for example
 * **Rotate the session/signing key:** delete `/data/secret_key` from the volume and redeploy.
 * **What did an agent do?** `/admin` → Audit logs.
 
+## Optional: container registry
+
+The same compose file can also run a private Docker registry (`registry:2`) with a web UI
+(`joxit/docker-registry-ui`), handy for pushing images that raw compose services then pull. It is
+off by default. To turn it on, add to the service's environment:
+
+```
+COMPOSE_PROFILES=registry
+REGISTRY_USERS=alice:<password>,ci:<password>
+```
+
+and two domains, both HTTPS: `cr.example.com` → service `registry-ui`, port `80`, and
+`cr.example.com` with path `/v2` → service `registry`, port `5000`. Deploy, then
+`docker login cr.example.com`.
+
+* **Users** live only in `REGISTRY_USERS` (`user:password`, comma-separated; a password may contain
+  `:` but not `,`). Every deploy rebuilds the registry's htpasswd file from it and restarts the
+  registry when it changed, so adding a user, changing a password or removing someone is an env
+  edit plus a deploy. If it is empty or malformed, the deploy fails and the registry stays down
+  rather than starting with nobody (or everybody) allowed in.
+* **Optional:** `REGISTRY_HTTP_SECRET` (a long random string; otherwise a random one per start,
+  which only interrupts uploads in flight during a restart), `REGISTRY_HTTP_HOST`
+  (`https://cr.example.com`), `REGISTRY_TITLE` (shown in the UI).
+* Agents cannot touch any of this: it is part of this server's own service, which the tools never
+  change. (The `mcp` container does receive these variables through `env_file: .env`.)
+* To turn it off, remove `COMPOSE_PROFILES` and its domains, deploy, and stop the leftover
+  `registry*` containers; images stay in the `registry-data` volume.
+
+To let agents deploy from it, add it to `ALLOWED_REGISTRIES=cr.example.com` and run
+`docker login cr.example.com` once on the Dokploy host so compose deploys can pull.
+
 ## Development
 
 ```
