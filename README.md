@@ -192,11 +192,8 @@ Then `docker login mcp.example.com` and push `mcp.example.com/team/app:1`; the U
   else gets `403` before the login prompt. The MCP's paths stay open to every address. The
   registry is closed by default: empty or unset refuses every address, and `REGISTRY_IPS=*` opens
   it to any address (logins still required). The gateway takes the client's address from
-  the last `X-Forwarded-For` entry, as the MCP does. Behind Cloudflare's proxy (orange cloud)
-  that is a Cloudflare edge, so when it is one of Cloudflare's published ranges the gateway uses
-  `CF-Connecting-IP` instead, which only Cloudflare can set. Behind any other CDN or proxy in
-  front of Traefik, the proxy's address is what gets checked. The gateway's access log shows the
-  address it checked as `client=`. An invalid entry locks the registry for
+  the last `X-Forwarded-For` entry, as the MCP does, so behind a CDN or another proxy in front of
+  Traefik that is the proxy's address, not the client's. An invalid entry locks the registry for
   everyone (see the `gateway` logs) rather than opening it; the MCP keeps working. Since the
   address comes from a header, a container on the host's `dokploy-network` could forge it, which
   is why the logins still apply on top. Changes take effect on the next deploy.
