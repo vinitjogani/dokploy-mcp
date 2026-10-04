@@ -6,7 +6,8 @@
 # on each request, so new logins apply without a restart).
 #
 # REGISTRY_IPS (comma-separated addresses or CIDR ranges) limits the registry and its UI to those
-# client addresses; the MCP's routes stay open to everyone. Empty means any address.
+# client addresses; the MCP's routes stay open to everyone. "*" opens the registry to any address;
+# empty (or unset) closes it to every address.
 set -eu
 
 conf=/etc/nginx/conf.d/default.conf
@@ -36,17 +37,22 @@ valid_ip() {
     esac
 }
 
-# The access rules for the registry and UI locations. Any bad entry denies everyone, so a typo
-# never opens the registry up wider than intended.
-acl=
+# The access rules for the registry and UI locations. Closed unless REGISTRY_IPS says otherwise,
+# and any bad entry denies everyone, so a typo never opens the registry up wider than intended.
+acl="        deny all;
+"
 if [ -n "$registry" ]; then
+    allows=
     allowed=
     bad=
+    any=
     set -f
     IFS=', '
     for entry in ${REGISTRY_IPS:-}; do
-        if valid_ip "$entry"; then
-            acl="$acl        allow $entry;
+        if [ "$entry" = "*" ]; then
+            any=1
+        elif valid_ip "$entry"; then
+            allows="$allows        allow $entry;
 "
             allowed="$allowed $entry"
         else
@@ -59,12 +65,19 @@ if [ -n "$registry" ]; then
         echo "gateway: REGISTRY_IPS has invalid entries:$bad; the registry refuses everyone" >&2
         acl="        deny all;
 "
+    elif [ -n "$any" ] && [ -n "$allowed" ]; then
+        echo "gateway: REGISTRY_IPS mixes \"*\" with addresses; use \"*\" alone to open it to all. The registry refuses everyone" >&2
+        acl="        deny all;
+"
+    elif [ -n "$any" ]; then
+        echo "gateway: REGISTRY_IPS=*: the registry is open to any address (logins still apply)"
+        acl=
     elif [ -n "$allowed" ]; then
         echo "gateway: registry open only to:$allowed"
-        acl="$acl        deny all;
+        acl="$allows        deny all;
 "
     else
-        echo "gateway: REGISTRY_IPS is empty; the registry is open to any address (logins still apply)"
+        echo "gateway: REGISTRY_IPS is empty; the registry refuses every address (set it, or \"*\" for any)" >&2
     fi
 fi
 

@@ -165,12 +165,12 @@ port is needed. If your Dokploy runs differently, set `DOKPLOY_URL` (for example
 The same deploy can also run a private Docker registry (`registry:2`) with a web UI
 (`joxit/docker-registry-ui`), on the **same domain**, handy for pushing images that raw compose
 services then pull. It is off by default. To turn it on, add to the service's environment and
-deploy:
+deploy (`REGISTRY_IPS` lists who may reach the registry and UI; `*` for anyone):
 
 ```
 COMPOSE_PROFILES=registry
 REGISTRY_USERS=alice:<password>,ci:<password>
-REGISTRY_IPS=203.0.113.5,198.51.100.0/24   # optional: who may reach the registry and UI
+REGISTRY_IPS=203.0.113.5,198.51.100.0/24
 ```
 
 No extra domains: the gateway keeps routing the MCP's paths (`/mcp`, `/oauth/`, `/admin/`,
@@ -189,8 +189,9 @@ Then `docker login mcp.example.com` and push `mcp.example.com/team/app:1`; the U
   either way.
 * **IP allowlist:** `REGISTRY_IPS=203.0.113.5,198.51.100.0/24` (addresses or CIDR ranges, IPv4 or
   IPv6, comma-separated) limits the registry API and the UI to those client addresses; anyone
-  else gets `403` before the login prompt. The MCP's paths stay open to every address. Empty (the
-  default) means any address, logins still required. The gateway takes the client's address from
+  else gets `403` before the login prompt. The MCP's paths stay open to every address. The
+  registry is closed by default: empty or unset refuses every address, and `REGISTRY_IPS=*` opens
+  it to any address (logins still required). The gateway takes the client's address from
   the last `X-Forwarded-For` entry, as the MCP does, so behind a CDN or another proxy in front of
   Traefik that is the proxy's address, not the client's. An invalid entry locks the registry for
   everyone (see the `gateway` logs) rather than opening it; the MCP keeps working. Since the
