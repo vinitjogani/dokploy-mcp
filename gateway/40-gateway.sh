@@ -4,12 +4,84 @@
 # registry routes. The registry itself has no auth: nginx checks every login against
 # /auth/htpasswd, which the registry-auth container rewrites on every deploy (nginx re-reads it
 # on each request, so new logins apply without a restart).
+#
+# REGISTRY_IPS (comma-separated addresses or CIDR ranges) limits the registry and its UI to those
+# client addresses; the MCP's routes stay open to everyone. "*" opens the registry to any address;
+# empty (or unset) closes it to every address.
 set -eu
 
 conf=/etc/nginx/conf.d/default.conf
 
 case ",${REGISTRY_PROFILES:-}," in *,registry,*) registry=1 ;; *) registry= ;; esac
+if [ -n "$registry" ]; then echo "gateway: registry on"; else echo "gateway: registry off"; fi
 
+# Prints 0 if $1 is an IPv4 or IPv6 address, optionally with a /prefix, that nginx's "allow" takes.
+valid_ip() {
+    case "$1" in
+        */) return 1 ;;
+        */*) addr=${1%/*} prefix=${1#*/} ;;
+        *) addr=$1 prefix= ;;
+    esac
+    case "$prefix" in *[!0-9]*) return 1 ;; esac
+    case "$addr" in
+        *:*)
+            case "$addr" in *[!0-9a-fA-F:.]*|*:::*) return 1 ;; esac
+            [ -z "$prefix" ] || [ "$prefix" -le 128 ]
+            ;;
+        *.*.*.*)
+            echo "$addr" | awk -F. 'NF != 4 { exit 1 }
+                { for (i = 1; i <= 4; i++) if ($i !~ /^[0-9]+$/ || $i > 255) exit 1 }' || return 1
+            [ -z "$prefix" ] || [ "$prefix" -le 32 ]
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+# The access rules for the registry and UI locations. Closed unless REGISTRY_IPS says otherwise,
+# and any bad entry denies everyone, so a typo never opens the registry up wider than intended.
+acl="        deny all;
+"
+if [ -n "$registry" ]; then
+    allows=
+    allowed=
+    bad=
+    any=
+    set -f
+    IFS=', '
+    for entry in ${REGISTRY_IPS:-}; do
+        if [ "$entry" = "*" ]; then
+            any=1
+        elif valid_ip "$entry"; then
+            allows="$allows        allow $entry;
+"
+            allowed="$allowed $entry"
+        else
+            bad="$bad $entry"
+        fi
+    done
+    unset IFS
+    set +f
+    if [ -n "$bad" ]; then
+        echo "gateway: REGISTRY_IPS has invalid entries:$bad; the registry refuses everyone" >&2
+        acl="        deny all;
+"
+    elif [ -n "$any" ] && [ -n "$allowed" ]; then
+        echo "gateway: REGISTRY_IPS mixes \"*\" with addresses; use \"*\" alone to open it to all. The registry refuses everyone" >&2
+        acl="        deny all;
+"
+    elif [ -n "$any" ]; then
+        echo "gateway: REGISTRY_IPS=*: the registry is open to any address (logins still apply)"
+        acl=
+    elif [ -n "$allowed" ]; then
+        echo "gateway: registry open only to:$allowed"
+        acl="$allows        deny all;
+"
+    else
+        echo "gateway: REGISTRY_IPS is empty; the registry refuses every address (set it, or \"*\" for any)" >&2
+    fi
+fi
+
+write_conf() {
 # Docker's resolver, re-asked every 10 s: upstreams are looked up per request, so nginx starts
 # (and the MCP stays up) whatever state the other containers are in.
 cat > "$conf" <<'NGINX'
@@ -43,18 +115,27 @@ server {
 NGINX
 
 if [ -n "$registry" ]; then
-    echo "gateway: registry on"
     cat >> "$conf" <<'NGINX'
     set $registry http://dokploy-mcp-registry:5000;
     set $registry_ui http://dokploy-mcp-registry-ui:80;
 
-    # The MCP server (Django): its URL prefixes.
+    # The client's address for REGISTRY_IPS, the same one the MCP uses: Traefik overwrites
+    # X-Forwarded-For from untrusted clients, and its last entry is the peer Traefik saw.
+    set_real_ip_from 0.0.0.0/0;
+    set_real_ip_from ::/0;
+    real_ip_header X-Forwarded-For;
+    real_ip_recursive off;
+
+    # The MCP server (Django): its URL prefixes. Open to every address.
     location ~ ^/(mcp|oauth|admin|static|\.well-known)(/|$) {
         proxy_pass $mcp;
     }
 
     # The registry API (docker login/push/pull, and the UI's own calls).
     location /v2/ {
+NGINX
+    printf '%s' "$acl" >> "$conf"
+    cat >> "$conf" <<'NGINX'
         auth_basic "Registry";
         auth_basic_user_file /auth/htpasswd;
         add_header Docker-Distribution-Api-Version $docker_distribution_api_version always;
@@ -67,6 +148,9 @@ if [ -n "$registry" ]; then
 
     # Everything else: the UI, behind the same login, so the browser asks once.
     location / {
+NGINX
+    printf '%s' "$acl" >> "$conf"
+    cat >> "$conf" <<'NGINX'
         auth_basic "Registry";
         auth_basic_user_file /auth/htpasswd;
         proxy_pass $registry_ui;
@@ -74,11 +158,21 @@ if [ -n "$registry" ]; then
 }
 NGINX
 else
-    echo "gateway: registry off"
     cat >> "$conf" <<'NGINX'
     location / {
         proxy_pass $mcp;
     }
 }
 NGINX
+fi
+}
+
+write_conf
+
+# Should nginx still reject an address, lock the registry rather than take the MCP down with it.
+if [ -n "$registry" ] && ! nginx -t -q 2>/dev/null; then
+    echo "gateway: nginx rejected the REGISTRY_IPS rules; the registry refuses everyone" >&2
+    acl="        deny all;
+"
+    write_conf
 fi
