@@ -170,6 +170,7 @@ deploy:
 ```
 COMPOSE_PROFILES=registry
 REGISTRY_USERS=alice:<password>,ci:<password>
+REGISTRY_IPS=203.0.113.5,198.51.100.0/24   # optional: who may reach the registry and UI
 ```
 
 No extra domains: the gateway keeps routing the MCP's paths (`/mcp`, `/oauth/`, `/admin/`,
@@ -186,6 +187,15 @@ Then `docker login mcp.example.com` and push `mcp.example.com/team/app:1`; the U
   reach. An entry without `user:password` is skipped and `registry-auth` exits with an error
   (see its logs); with no valid entry, every registry request is refused. The MCP keeps working
   either way.
+* **IP allowlist:** `REGISTRY_IPS=203.0.113.5,198.51.100.0/24` (addresses or CIDR ranges, IPv4 or
+  IPv6, comma-separated) limits the registry API and the UI to those client addresses; anyone
+  else gets `403` before the login prompt. The MCP's paths stay open to every address. Empty (the
+  default) means any address, logins still required. The gateway takes the client's address from
+  the last `X-Forwarded-For` entry, as the MCP does, so behind a CDN or another proxy in front of
+  Traefik that is the proxy's address, not the client's. An invalid entry locks the registry for
+  everyone (see the `gateway` logs) rather than opening it; the MCP keeps working. Since the
+  address comes from a header, a container on the host's `dokploy-network` could forge it, which
+  is why the logins still apply on top. Changes take effect on the next deploy.
 * **Optional:** `REGISTRY_HTTP_SECRET` (a long random string; otherwise a random one per start,
   which only interrupts uploads in flight during a restart), `REGISTRY_TITLE` (shown in the UI).
 * Agents cannot touch any of this: it is part of this server's own service, which the tools never

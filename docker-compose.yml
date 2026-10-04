@@ -9,6 +9,7 @@ services:
     restart: unless-stopped
     environment:
       REGISTRY_PROFILES: ${COMPOSE_PROFILES:-}
+      REGISTRY_IPS: ${REGISTRY_IPS:-}  # who may reach the registry and UI; the MCP stays open
     volumes:
       - ./gateway/40-gateway.sh:/docker-entrypoint.d/40-gateway.sh:ro
       - registry-auth:/auth:ro
