@@ -5,7 +5,7 @@
 services:
   # The only service Traefik routes to: stock nginx, configured by gateway/40-gateway.sh.
   gateway:
-    image: nginx:1.29-alpine
+    image: nginx:1.30-alpine  # stable branch; 1.29 no longer gets rebuilds
     restart: unless-stopped
     environment:
       REGISTRY_PROFILES: ${COMPOSE_PROFILES:-}
@@ -81,10 +81,11 @@ services:
         exit $$status
 
   registry:
-    image: registry:2
+    image: registry:3
     profiles: [registry]
     restart: unless-stopped
     environment:
+      OTEL_TRACES_EXPORTER: none  # v3 traces to localhost:4318 by default and logs every failed export
       REGISTRY_STORAGE_DELETE_ENABLED: "true"
       REGISTRY_HEALTH_STORAGEDRIVER_ENABLED: "false"
       REGISTRY_HTTP_RELATIVEURLS: "true"

@@ -162,7 +162,7 @@ port is needed. If your Dokploy runs differently, set `DOKPLOY_URL` (for example
 
 ## Optional: container registry
 
-The same deploy can also run a private Docker registry (`registry:2`) with a web UI
+The same deploy can also run a private Docker registry (`registry:3`) with a web UI
 (`joxit/docker-registry-ui`), on the **same domain**, handy for pushing images that raw compose
 services then pull. It is off by default. To turn it on, add to the service's environment and
 deploy (`REGISTRY_IPS` lists who may reach the registry and UI; `*` for anyone):
@@ -181,7 +181,7 @@ Then `docker login mcp.example.com` and push `mcp.example.com/team/app:1`; the U
 * **Logins** live only in `REGISTRY_USERS` (`user:password`, comma-separated; a password may
   contain `:` but not `,`). On every deploy a one-shot `registry-auth` container (stock
   `httpd:2-alpine`, for its `htpasswd`) rebuilds a bcrypt htpasswd file from it, and the gateway
-  (stock `nginx:1.29-alpine`) checks every registry and UI request against that file, re-reading
+  (stock `nginx:1.30-alpine`) checks every registry and UI request against that file, re-reading
   it each time. So adding a user, changing a password or removing someone is an env edit plus a
   deploy. The registry itself has no auth and sits on a private network only the gateway can
   reach. An entry without `user:password` is skipped and `registry-auth` exits with an error
